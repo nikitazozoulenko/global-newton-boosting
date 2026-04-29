@@ -66,7 +66,6 @@ def build_decision_tree_layer(
     X_bin_idxs: UInt8[Array, "N D"],
     gh: Float[Array, "N p 2"],
     num_bins: int, 
-    l2_reg: float, 
 ):
     """Builds a single layer of the tree, updating sample_to_node indices and node split info."""
     max_num_nodes = 2**(max_depth-1)
@@ -86,11 +85,12 @@ def build_decision_tree_layer(
 
         # 2. Calculate gain. The formula is applied element-wise over the 'p' dimension,
         #    and then summed to get a single scalar gain value for each split.
-        left_gain = jnp.sum(g_cumsum**2 / (h_cumsum + l2_reg), axis=-1) # shape (max_num_nodes, num_bins)
+        eps = 1e-7
+        left_gain = jnp.sum(g_cumsum**2 / (h_cumsum + eps), axis=-1) # shape (max_num_nodes, num_bins)
         right_g = total_g[:, None, :] - g_cumsum
         right_h = total_h[:, None, :] - h_cumsum
-        right_gain = jnp.sum(right_g**2 / (right_h + l2_reg), axis=-1) # shape (max_num_nodes, num_bins)
-        dont_split_gain = jnp.sum(total_g**2 / (total_h + l2_reg), axis=-1) # shape (max_num_nodes,)
+        right_gain = jnp.sum(right_g**2 / (right_h + eps), axis=-1) # shape (max_num_nodes, num_bins)
+        dont_split_gain = jnp.sum(total_g**2 / (total_h + eps), axis=-1) # shape (max_num_nodes,)
         gain = left_gain + right_gain - dont_split_gain[:, None] # shape (max_num_nodes, num_bins)
         
         # 3. Get the best gain value and its corresponding bin index for each node.
@@ -136,9 +136,9 @@ def hilbert_norm(g: Float[Array, "N p"]) -> float:
     return g_norm
 
 
-def T_norm(x: Float[Array, "N p"], h: Float[Array, "N p"], lambda_t:float) -> float:
-    return hilbert_norm( x * jnp.sqrt(h + lambda_t)) # TODO idk if this works with p != 1
-    
+def T_norm(x: Float[Array, "N p"], h_reg: Float[Array, "N p"]) -> float:
+    return hilbert_norm( x * jnp.sqrt(h_reg))
+
 
 history_order = {
     "g_norm": 0,
@@ -175,14 +175,15 @@ def fit_decision_tree(
     # initialize carry
     N, D = X_bin_idxs.shape
     sample_to_node = jnp.zeros((N,), dtype=jnp.int32)
-    gh = jnp.stack([grad, hess], axis=-1)  # shape (N, p, 2)
     
-    # Apply gradient regularization if specified
-    _l2_reg = l2_reg
-    if grad_regularized_l2 > 0.0:
-        g_norm = hilbert_norm(grad)  # float
-        lambda_t = jnp.sqrt(grad_regularized_l2 * g_norm)   # float
-        _l2_reg = _l2_reg + lambda_t
+    # Apply gradient regularization if specified (default no change since grad_regularized_l2=0)
+    g_norm = hilbert_norm(grad)  # float
+    lambda_t = jnp.sqrt(grad_regularized_l2 * g_norm)   # float
+    _l2_reg = l2_reg + lambda_t
+    
+    # stack g with h_reg
+    hess_reg = hess + _l2_reg # NOTE: this differs slightly from XGBoost's l2 regularization. Ours depends on the number of leafs in the split
+    gh = jnp.stack([grad, hess_reg], axis=-1)  # shape (N, p, 2)
 
     # loop over depth [0, max_depth) to build tree
     def scan_body_build_one_decision_tree_layer(carry, depth):
@@ -194,7 +195,6 @@ def fit_decision_tree(
             X_bin_idxs=X_bin_idxs,
             gh=gh,
             num_bins=num_bins,
-            l2_reg=_l2_reg,
         )
         return sample_to_node, (nodewise_dims, nodewise_bins, nodewise_gains)
     
@@ -208,10 +208,11 @@ def fit_decision_tree(
     )
     
     # NOTE Currently does not include any pruning.
+    eps = 1e-7
     leaf_gh = jax.ops.segment_sum(gh, sample_to_node, num_segments=2**max_depth) # shape (2**max_depth, p, 2).
     leaf_grad = leaf_gh[..., 0] # shape (2**max_depth, p)
     leaf_hess = leaf_gh[..., 1] # shape (2**max_depth, p)
-    leaf_values = -leaf_grad / (leaf_hess + _l2_reg) # shape (2**max_depth, p)
+    leaf_values = -leaf_grad / (leaf_hess + eps) # shape (2**max_depth, p)
     
     # Compute this tree's prediction for each sample by looking up its leaf value.
     pred = leaf_values[sample_to_node] # shape (N, p)
@@ -220,16 +221,15 @@ def fit_decision_tree(
     history = None
     if include_history:
         g_norm = hilbert_norm(grad)
-        lambda_t = jnp.sqrt(grad_regularized_l2 * g_norm) # float
         f_weak = pred
-        f_exact = - grad /(hess + l2_reg + lambda_t)
+        f_exact = - grad /(hess_reg)
         hilbert_norm_f_weak = hilbert_norm(f_weak)
         hilbert_norm_f_exact = hilbert_norm(f_exact)
-        t_norm_weak = T_norm(f_weak, hess, l2_reg + lambda_t)
-        t_norm_exact = T_norm(f_exact, hess, l2_reg + lambda_t)
+        t_norm_weak = T_norm(f_weak, hess_reg)
+        t_norm_exact = T_norm(f_exact, hess_reg)
         hilbert_cosangle = jnp.mean(f_weak * f_exact) / (hilbert_norm_f_weak * hilbert_norm_f_exact)
-        t_cosangle = jnp.mean(f_weak * f_exact * (hess+l2_reg+lambda_t)) / (t_norm_weak * t_norm_exact)
-        g_weak = - (hess + l2_reg + lambda_t) * f_weak
+        t_cosangle = jnp.mean(f_weak * f_exact * (hess_reg)) / (t_norm_weak * t_norm_exact)
+        g_weak = - (hess_reg) * f_weak
         one_minus_edge_sq = hilbert_norm(g_weak-grad)**2 / hilbert_norm(grad)**2
         weak_g_edge = jnp.sqrt(jnp.maximum(0.0, 1.0 - one_minus_edge_sq))
         history = (g_norm, lambda_t, hilbert_norm_f_weak, hilbert_norm_f_exact, 
